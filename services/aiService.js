@@ -1,7 +1,10 @@
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+const Groq = require("groq-sdk");
 const Tenis = require("../models/Tenis");
 
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+// Usamos GEMINI_API_KEY como nombre de variable para no tener que renombrarla en el panel de Railway,
+// pero internamente inicializamos el cliente de Groq.
+const apiKey = process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY;
+const groq = new Groq({ apiKey });
 
 const SYSTEM_PROMPT = `
 Eres "Kicks", el asistente virtual experto de SneakersBoot MX, la tienda de tenis más cool de México.
@@ -30,28 +33,36 @@ Reglas adicionales:
 
 const tools = [
   {
-    functionDeclarations: [
-      {
-        name: "buscarTenis",
-        description: "Busca tenis en el catálogo de SneakersBoot MX por nombre, marca, o descripción. Úsala cuando el cliente pregunte por un modelo o marca específica.",
-        parameters: { type: "OBJECT", properties: { query: { type: "STRING", description: "El término de búsqueda, ej: 'Air Jordan', 'Nike'" } }, required: ["query"] }
-      },
-      {
-        name: "filtrarPorPrecio",
-        description: "Filtra el catálogo de tenis por un precio máximo en pesos mexicanos (MXN). Úsala cuando el cliente mencione un presupuesto.",
-        parameters: { type: "OBJECT", properties: { precioMaximo: { type: "NUMBER", description: "El precio máximo en MXN" } }, required: ["precioMaximo"] }
-      },
-      {
-        name: "verificarTalla",
-        description: "Verifica qué tenis están disponibles en una talla específica (sistema US). Úsala cuando el cliente pregunte por su talla.",
-        parameters: { type: "OBJECT", properties: { talla: { type: "NUMBER", description: "La talla en sistema americano (US), ej: 9, 9.5" } }, required: ["talla"] }
-      },
-      {
-        name: "obtenerCatalogo",
-        description: "Obtiene una página de productos del catálogo (10 por página). Úsala para mostrar el inventario general. Si el cliente pide ver más, aumenta el parámetro de página.",
-        parameters: { type: "OBJECT", properties: { page: { type: "NUMBER", description: "Número de página a consultar, por defecto 1" } } }
-      }
-    ]
+    type: "function",
+    function: {
+      name: "buscarTenis",
+      description: "Busca tenis en el catálogo de SneakersBoot MX por nombre, marca, o descripción. Úsala cuando el cliente pregunte por un modelo o marca específica.",
+      parameters: { type: "object", properties: { query: { type: "string", description: "El término de búsqueda, ej: 'Air Jordan', 'Nike'" } }, required: ["query"] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "filtrarPorPrecio",
+      description: "Filtra el catálogo de tenis por un precio máximo en pesos mexicanos (MXN). Úsala cuando el cliente mencione un presupuesto.",
+      parameters: { type: "object", properties: { precioMaximo: { type: "number", description: "El precio máximo en MXN" } }, required: ["precioMaximo"] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "verificarTalla",
+      description: "Verifica qué tenis están disponibles en una talla específica (sistema US). Úsala cuando el cliente pregunte por su talla.",
+      parameters: { type: "object", properties: { talla: { type: "number", description: "La talla en sistema americano (US), ej: 9, 9.5" } }, required: ["talla"] }
+    }
+  },
+  {
+    type: "function",
+    function: {
+      name: "obtenerCatalogo",
+      description: "Obtiene una página de productos del catálogo (10 por página). Úsala para mostrar el inventario general. Si el cliente pide ver más, aumenta el parámetro de página.",
+      parameters: { type: "object", properties: { page: { type: "number", description: "Número de página a consultar, por defecto 1" } } }
+    }
   }
 ];
 
@@ -100,51 +111,72 @@ async function ejecutarFuncion(nombreFuncion, args) {
 }
 
 /**
- * Función principal para procesar mensajes a través de Gemini AI.
+ * Función principal para procesar mensajes a través de Groq AI.
  * @param {string} message - El mensaje del usuario.
  * @param {Array} history - El historial de la conversación.
  */
 async function procesarMensajeAI(message, history = []) {
-  if (!process.env.GEMINI_API_KEY) {
-    throw new Error("La variable GEMINI_API_KEY no está configurada.");
+  if (!apiKey) {
+    throw new Error("La API KEY no está configurada.");
   }
 
-  const model = genAI.getGenerativeModel({
-    model: process.env.GEMINI_MODEL || "gemini-2.0-flash", // Usa env var si existe
-    systemInstruction: SYSTEM_PROMPT,
+  const formattedHistory = [
+    { role: "system", content: SYSTEM_PROMPT }
+  ];
+
+  for (const msg of history) {
+      formattedHistory.push({
+          role: msg.role === "model" ? "assistant" : "user",
+          content: msg.text || ""
+      });
+  }
+
+  const newMessages = [...formattedHistory, { role: "user", content: message }];
+
+  let completion = await groq.chat.completions.create({
+    messages: newMessages,
+    model: "llama-3.3-70b-versatile",
     tools: tools,
+    tool_choice: "auto",
   });
 
-  // Limpieza robusta del historial: Gemini falla si recibe 'functionCall' inválidos en llamadas nuevas.
-  const formattedHistory = history.map((msg) => ({
-    role: msg.role === "model" ? "model" : "user",
-    parts: [{ text: msg.text || "" }],
-  })).filter(msg => msg.parts[0].text.trim() !== "");
-
-  const chat = model.startChat({ history: formattedHistory });
-  let result = await chat.sendMessage(message);
-  let response = result.response;
+  let responseMessage = completion.choices[0].message;
 
   // Manejar el ciclo de Function Calling
-  while (response.functionCalls && response.functionCalls().length > 0) {
-    const funcionesAEjecutar = response.functionCalls();
-    const resultadosFunciones = [];
-
-    for (const fn of funcionesAEjecutar) {
-      const resultado = await ejecutarFuncion(fn.name, fn.args);
-      resultadosFunciones.push({
-        functionResponse: {
-          name: fn.name,
-          response: { result: resultado },
-        },
+  while (responseMessage.tool_calls && responseMessage.tool_calls.length > 0) {
+    newMessages.push(responseMessage);
+    
+    const toolCalls = responseMessage.tool_calls;
+    
+    for (const toolCall of toolCalls) {
+      let args = {};
+      try {
+        args = JSON.parse(toolCall.function.arguments);
+      } catch(e) {
+        console.error("Error parseando argumentos:", e);
+      }
+      
+      const resultado = await ejecutarFuncion(toolCall.function.name, args);
+      
+      newMessages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        name: toolCall.function.name,
+        content: JSON.stringify(resultado),
       });
     }
 
-    result = await chat.sendMessage(resultadosFunciones);
-    response = result.response;
+    completion = await groq.chat.completions.create({
+      messages: newMessages,
+      model: "llama-3.3-70b-versatile",
+      tools: tools,
+      tool_choice: "auto",
+    });
+    
+    responseMessage = completion.choices[0].message;
   }
 
-  const replyText = response.text();
+  const replyText = responseMessage.content || "Lo siento, no pude formular una respuesta.";
 
   return {
     reply: replyText,
